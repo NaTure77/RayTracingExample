@@ -1,0 +1,315 @@
+#pragma kernel CSMain
+
+struct hittable
+{
+    float radius;
+    float3 center;
+    float3 albedo;
+    int mat;
+};
+struct hit_record
+{
+    float3 p;
+    float3 normal;
+    int mat;
+    bool front_face;
+};
+struct ray
+{
+    float3 direction;
+    float3 origin;
+    float3 current_albedo;
+    bool hit;
+};
+
+RWTexture2D<float4> Result;
+
+float2 resolution;
+float3 origin;
+float3 lower_left_corner;
+float3 horizontal;
+float3 vertical;
+
+float3 w;
+float3 u;
+float3 v;
+
+float3 randNum;
+
+uint max_depth;
+uint depth_per_frame;
+uint object_count;
+
+float fuzz;
+float lens_radius;
+bool updated;
+
+RWStructuredBuffer<hittable> objects;
+RWStructuredBuffer<float3> color_sum;
+RWStructuredBuffer<ray> rays;
+RWStructuredBuffer<uint2> traced_cnt;
+RWStructuredBuffer<uint> seeds;
+
+uint random(uint s)
+{
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s;
+}
+
+float nextRandom(int idx1D)
+{
+    uint seed = seeds[idx1D];
+    seed = random(seed);
+    seeds[idx1D] = seed;
+    return float(seed) / 4294967295.0;
+}
+
+float uintTofloat(uint s)
+{
+    return float(s) / 4294967295.0;
+}
+float3 random_in_unit_sphere(int idx1D)
+{
+    float3 p;
+    uint seed = seeds[idx1D];
+    while (true)
+    {
+        seed = random(seed);
+        float x = uintTofloat(seed);
+
+        seed = random(seed);
+        float y = uintTofloat(seed);
+
+        seed = random(seed);
+        float z = uintTofloat(seed);
+
+        p = float3(x,y,z) * 2 - 1;
+
+        if (length(p) >= 1)
+        {
+            continue;
+        }
+        break;
+    }
+    seeds[idx1D] = seed;
+    return p;
+
+}
+
+float2 random_in_unit_disk(int idx1D)
+{
+    float2 p;
+    uint seed = seeds[idx1D];
+    while (true)
+    {
+        seed = random(seed);
+        float x = uintTofloat(seed);
+
+        seed = random(seed);
+        float y = uintTofloat(seed);
+
+        p = float2(x, y) * 2 - 1;
+        if (length(p) >= 1)
+        {
+            continue;
+        }
+        break;
+    }
+    seeds[idx1D] = seed;
+    return p;
+}
+
+float3 reflect(float3 v, float3 n)
+{
+    return v - 2 * dot(v, n) * n;
+}
+
+float reflectance(float cosine, float ref_idx)
+{
+    // Use Schlick's approximation for reflectance.
+    float r0 = (1 - ref_idx) / (1 + ref_idx);
+    r0 = r0 * r0;
+    return r0 + (1 - r0) * pow((1 - cosine), 5);
+}
+float3 refract(float3 uv, float3 n, float etai_over_etat)
+{
+    float cos_theta = min(dot(-uv, n), 1.0);
+    float3 r_out_perp = etai_over_etat * (uv + cos_theta * n);
+    float3 r_out_parallel = -sqrt(abs(1.0 - length(r_out_perp) * length(r_out_perp))) * n;
+    return r_out_perp + r_out_parallel;
+}
+
+ray ray_color(ray r, int idx1D)
+{
+    bool hit_anything = false;
+    hittable obj;
+
+    uint depth = 0;
+    float3 result = r.current_albedo;
+    hit_record rec;
+    rec.p = 0;
+    rec.normal = 0;
+    rec.mat = 0;
+    float t_min = 0.001;
+    float t_max = 3.402823466e+38F;
+
+    float closest_so_far = t_max;
+    float3 albedo = float3(1,1,1);
+    
+    while (depth++ < depth_per_frame)
+    {
+        closest_so_far = t_max;
+        hit_anything = false;
+        r.hit = false;
+
+        for (uint i = 0; i < object_count; i++)
+        {
+            obj = objects[i];
+            float3 oc = r.origin - obj.center;
+            float a = length(r.direction) * length(r.direction);
+            float half_b = dot(oc, r.direction);
+            float c = length(oc) * length(oc) - obj.radius * obj.radius;
+
+            float discriminant = half_b * half_b - a * c; //(b^2) / 4 - ac
+            if (discriminant < 0) continue;
+            float sqrtd = sqrt(discriminant);
+
+            // Find the nearest root that lies in the acceptable range.
+            float root = (-half_b - sqrtd) / a;
+            if (root < t_min || closest_so_far < root)
+            {
+                root = (-half_b + sqrtd) / a;
+                if (root < t_min || closest_so_far < root)
+                    continue;
+            }
+
+            closest_so_far = root;
+            hit_anything = true;
+            
+            albedo = obj.albedo;
+            rec.p = r.origin + r.direction * root;
+            float3 outward_normal = (rec.p - obj.center) / obj.radius;
+
+            rec.front_face = dot(r.direction, outward_normal) < 0;
+            rec.normal = rec.front_face ? outward_normal : outward_normal * -1;
+            rec.mat = obj.mat;
+        }
+
+        if (hit_anything)
+        {
+            r.hit = true;
+            //metal
+            if (rec.mat == 0)
+            {
+                float3 reflected = reflect(normalize(r.direction), rec.normal);
+
+                r.origin = rec.p;
+                r.direction = reflected + fuzz * random_in_unit_sphere(idx1D);
+                result *= albedo;
+
+                if (dot(r.direction, rec.normal) <= 0)
+                {
+                    r.hit = false;
+                    r.current_albedo = 0;
+                    return r;
+                }
+            }
+
+            //lambertian
+            else if (rec.mat == 1)
+            {
+                float3 scatter_direction = rec.normal + normalize(random_in_unit_sphere(idx1D));
+                if (all(scatter_direction) < 1e-4) scatter_direction = rec.normal;
+
+                r.origin = rec.p;
+                r.direction = scatter_direction;
+                result *= albedo;
+            }
+
+            //dielectric
+            else if (rec.mat == 2)
+            {
+                float ir = 1.5; //index_of_refraction
+                float refraction_ratio = rec.front_face ? (1.0 / ir) : ir;
+                float3 unit_direction = normalize(r.direction);
+
+                float cos_theta = min(dot(-unit_direction, rec.normal), 1.0);
+                float sin_theta = sqrt(1.0f - cos_theta * cos_theta);
+                bool cannot_refract = refraction_ratio * sin_theta > 1.0;
+
+                r.origin = rec.p;
+                if (cannot_refract || reflectance(cos_theta, refraction_ratio) > nextRandom(idx1D))
+                    r.direction = reflect(unit_direction, rec.normal);
+                else
+                    r.direction = refract(unit_direction, rec.normal, refraction_ratio);
+            }
+            r.direction = normalize(r.direction);
+            continue;
+        }
+        r.hit = false;
+        float3 unitDirection = normalize(r.direction);
+        float t = 0.5f * (unitDirection.y + 1.0f);
+        result *= (1.0f - t) * 1 + t * float3(0.5f, 0.7f, 1.0f);
+        break;
+    }
+    r.current_albedo = result;
+    return r;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    // Loading previous data
+    int idx1D = id.y * resolution.x + id.x;
+    ray r = rays[idx1D];
+    float3 colorSum = color_sum[idx1D];
+    uint2 tracedCnt = traced_cnt[idx1D];
+    // check if modified camera position or direction
+    if (updated)
+    {
+        colorSum = 0;
+        tracedCnt = 0;
+    }
+
+
+    if (tracedCnt.x == 0)
+    {
+        float2 st = ((id.xy + nextRandom(idx1D) /** !updated*/) / (resolution - 1));
+        float2 rd = lens_radius * random_in_unit_disk(idx1D); /** !updated*/;
+        float3 offset = u * rd.x + v * rd.y;
+
+        r.origin = origin + offset;
+        r.direction = normalize(lower_left_corner + st.x * horizontal + st.y * vertical - (origin + offset));
+        r.current_albedo = 1;
+    }
+
+    //path tracing
+    r = ray_color(r, idx1D);
+    tracedCnt.x += depth_per_frame;
+
+    //check if hit & approaches to max_depth
+    if (!r.hit || tracedCnt.x > max_depth)
+    {
+        tracedCnt.x = 0;
+        tracedCnt.y++;
+        colorSum += r.current_albedo;
+        r.current_albedo = 1;
+    }
+
+    //Write back
+    traced_cnt[idx1D] = tracedCnt;
+    color_sum[idx1D] = colorSum;
+    rays[idx1D] = r;
+
+    //draw pixel
+    float3 pixel_color;
+    if (tracedCnt.y != 0) pixel_color = colorSum / tracedCnt.y;
+    else pixel_color = r.current_albedo;
+    Result[id.xy] = float4(sqrt(pixel_color), 1);
+    //Result[id.xy] = float4(r.direction, 1);
+}

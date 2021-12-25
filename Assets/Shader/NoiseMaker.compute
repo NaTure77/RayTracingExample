@@ -1,0 +1,36 @@
+﻿#pragma kernel TesterKernel
+
+float r;
+RWTexture2D<float4> Result;
+RWStructuredBuffer<uint> seed;
+uint Hash(uint s)
+{
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s;
+}
+
+float Random(uint seed)
+{
+    return float(Hash(seed)) / 4294967295.0; // 2^32-1
+}
+
+[numthreads(8, 8, 1)]
+void TesterKernel(uint2 id : SV_DispatchThreadID)
+{
+    float w, h;
+    Result.GetDimensions(w, h);
+
+    int idx1D = id.y * w + id.x;
+    uint s = seed[idx1D];
+
+    s = Hash(s);
+    seed[idx1D] = s;
+
+    float4 result = Random(s);
+    Result[id.xy] = result;
+}
